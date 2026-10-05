@@ -42,10 +42,11 @@ function load(){
   var u="/api/clips?game="+game+"&limit=40"+(ids.value?"&ids="+encodeURIComponent(ids.value):"");
   fetch(u).then(function(r){return r.json()}).then(function(d){
     var p=d.progress||{},h="";
-    st.textContent=(p.running||p.queued)?("Analyse en cours… "+(p.analysed||0)+" matchs analysés, "+(p.queued||0)+" en attente (limite 30 req/min)"):((p.analysed||0)+" matchs analysés");
+    st.textContent=(p.running||p.queued)?("Analyse en cours… "+(p.analysed||0)+" matchs analysés, "+(p.queued||0)+" en attente (limite 30 req/min)"):((p.analysed||0)+" matchs analysés"+(p.stats?" ("+p.stats.withPerf+" avec stats détaillées, "+p.stats.noPerf+" sans)":""));
     if(d.error)h+='<div class="err">'+esc(d.error)+"</div>";
     if(p.errors&&p.errors.length)h+='<div class="err">'+p.errors.map(esc).join("<br>")+"</div>";
     if(d.pending&&d.pending.length)h+='<div class="note">'+d.pending.join(", ").toUpperCase()+" : en attente de l'API GRID.</div>";
+    if(!(d.clips||[]).length&&p.empty&&p.empty.length)h+='<div class="note">Matchs sans moment : '+p.empty.map(function(i){return '<a href="/api/clips/debug?id='+Number(i)+'" target="_blank">'+Number(i)+"</a>"}).join(", ")+"</div>";
     var clips=d.clips||[];
     if(!clips.length&&!(d.pending&&d.pending.length))h+='<div class="note">'+((p.running||p.queued)?"Rien pour l'instant, ça arrive…":"Aucun moment trouvé.")+"</div>";
     clips.forEach(function(c){
