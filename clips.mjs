@@ -1,197 +1,228 @@
-// clips.mjs — classe les rounds les plus "clipables" (ace, clutch, folie...)
-// Valorant : Henrik API (unofficial-valorant-api). CS2 / RL : en attente (GRID).
-// Node 18+. Usage CLI :  node clips.mjs [valorant|cs2|rl|all] [limit]
-// Usage Express :        import { registerClipsRoute } from './clips.mjs'; registerClipsRoute(app);
-
-import { pathToFileURL } from 'node:url';
+// clips.mjs — meilleurs moments des matchs Valorant PRO (données VLR.gg via l'API Henrik)
+// CS2 / RL : en attente (GRID). Limite Henrik : 30 requêtes/min -> file d'attente à ~27/min,
+// cache en mémoire (un match terminé n'est analysé qu'une fois), analyse en arrière-plan.
 
 const HENRIK = 'https://api.henrikdev.xyz';
-const KEY = process.env.HENRIK_KEY || '';
-// Joueurs à suivre, format "Nom#Tag@region" séparés par des virgules
-const PLAYERS = (process.env.CLIP_PLAYERS || 'ManuelHexe#5777@eu')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const MATCHES_PER_PLAYER = Number(process.env.CLIP_MATCHES || 10);
-const MIN_SCORE = Number(process.env.CLIP_MIN_SCORE || 50);
-const CACHE_TTL = 10 * 60 * 1000;
+const num = (v, d) => (Number.isFinite(Number(v)) && v !== undefined && v !== '' ? Number(v) : d);
+const cfg = () => ({
+  key: process.env.HENRIK_KEY || '',
+  interval: num(process.env.HENRIK_INTERVAL_MS, 2200), // 2,2 s => ~27 req/min
+  regions: (process.env.CLIP_REGIONS || 'europe,north_america,asia_pacific').split(',').map(s => s.trim()).filter(Boolean),
+  eventsPerRegion: num(process.env.CLIP_EVENTS, 2),
+  maxMatches: num(process.env.CLIP_MAX_MATCHES, 40),
+  refreshMs: num(process.env.CLIP_REFRESH_MIN, 30) * 60000,
+  minScore: num(process.env.CLIP_MIN_SCORE, 60),
+  eventMatchesPath: process.env.EVENT_MATCHES_PATH || '/valorant/v2/esports/vlr/events/{id}/matches',
+});
 
-const MULTI = { 3: 30, 4: 80, 5: 200 };
-const CLUTCH = { 1: 15, 2: 40, 3: 90, 4: 160, 5: 250 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function henrik(path) {
-  for (let i = 0; i < 3; i++) {
-    const res = await fetch(HENRIK + path, { headers: { Authorization: KEY } });
-    if (res.status === 429) { await sleep(2000 * (i + 1)); continue; }
+// ---------- Limiteur global : jamais plus d'1 requête toutes les `interval` ms ----------
+let chain = Promise.resolve();
+let lastCall = 0;
+function limited(fn) {
+  const run = chain.then(async () => {
+    const wait = lastCall + cfg().interval - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCall = Date.now();
+    return fn();
+  });
+  chain = run.catch(() => {});
+  return run;
+}
+
+async function henrik(path, query = {}) {
+  const qs = new URLSearchParams(query).toString();
+  const url = HENRIK + path + (qs ? '?' + qs : '');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await limited(() => fetch(url, { headers: { Authorization: cfg().key } }));
+    if (res.status === 429) {
+      const ra = Number(res.headers.get('retry-after'));
+      await sleep(ra > 0 ? ra * 1000 : 30000 * (attempt + 1)); // on laisse la fenêtre se vider
+      continue;
+    }
     if (!res.ok) throw new Error(`Henrik ${res.status} ${path}`);
     return (await res.json()).data;
   }
-  throw new Error('Henrik: rate limit');
+  throw new Error('Henrik : limite de requêtes (429) persistante');
 }
 
-// ---------- Scoring d'un match Valorant (format Henrik v3) ----------
-export function scoreMatch(m) {
-  const meta = m.metadata || {};
-  const all = m.players.all_players;
-  const info = Object.fromEntries(all.map(p => [p.puuid, p]));
-  const teams = {
-    Red: all.filter(p => p.team === 'Red').map(p => p.puuid),
-    Blue: all.filter(p => p.team === 'Blue').map(p => p.puuid),
-  };
-  const byRound = {};
-  for (const k of m.kills || []) (byRound[k.round] ||= []).push(k);
+// ---------- Score d'un match pro ----------
+const MK = [['5k', 200, 'ACE'], ['4k', 80, '4K'], ['3k', 30, '3K']];
+const CL = [['1v5', 400], ['1v4', 200], ['1v3', 90], ['1v2', 30], ['1v1', 5]];
 
+export function momentsFromMatch(d, id) {
+  const perf = d?.performance?.player_performances || [];
+  const teamOf = {}, agentsOf = {};
+  for (const g of d?.games || []) {
+    for (const t of g.teams || []) {
+      for (const p of t.players || []) {
+        const pid = p.player?.id;
+        if (pid == null) continue;
+        teamOf[pid] ??= t.name;
+        (agentsOf[pid] ||= new Set()).add(p.agent);
+      }
+    }
+  }
   const out = [];
-  (m.rounds || []).forEach((r, i) => {
-    const kills = (byRound[i] || []).sort((a, b) => a.kill_time_in_round - b.kill_time_in_round);
-    if (!kills.length) return;
-    const winner = r.winning_team;
-
-    // Qui est le dernier en vie, et face à combien ?
-    const alive = { Red: new Set(teams.Red), Blue: new Set(teams.Blue) };
-    const clutch = {};
-    for (const k of kills) {
-      alive[k.victim_team]?.delete(k.victim_puuid);
-      for (const t of ['Red', 'Blue']) {
-        const o = t === 'Red' ? 'Blue' : 'Red';
-        if (!clutch[t] && alive[t].size === 1 && alive[o].size > 0) {
-          clutch[t] = { puuid: [...alive[t]][0], vs: alive[o].size };
-        }
-      }
+  for (const pp of perf) {
+    const mk = pp.multi_kills || {}, cl = pp.clutches || {};
+    let score = 0;
+    const tags = [];
+    for (const [k, pts, label] of MK) {
+      if (mk[k]) { score += pts * mk[k]; tags.push(mk[k] > 1 ? `${label} ×${mk[k]}` : label); }
     }
-
-    const per = {};
-    for (const k of kills) {
-      if (k.killer_team !== k.victim_team) (per[k.killer_puuid] ||= []).push(k);
+    for (const [k, pts] of CL) {
+      if (cl[k]) { score += pts * cl[k]; if (k !== '1v1') tags.push(`CLUTCH ${k}${cl[k] > 1 ? ` ×${cl[k]}` : ''}`); }
     }
-
-    for (const [puuid, ks] of Object.entries(per)) {
-      const p = info[puuid];
-      if (!p) continue;
-      const n = ks.length;
-      let score = n * 10;
-      const tags = [];
-
-      if (n >= 3) {
-        score += MULTI[Math.min(n, 5)];
-        tags.push(n >= 5 ? 'ACE' : `${n}K`);
-        if (ks[n - 1].kill_time_in_round - ks[0].kill_time_in_round <= 10000) {
-          score += 25; tags.push('RAPIDE');
-        }
-      }
-
-      const hs = r.player_stats?.find(s => s.player_puuid === puuid)?.headshots || 0;
-      score += hs * 3;
-      if (hs >= 3) tags.push(`${hs} HS`);
-
-      const knives = ks.filter(k => /knife|melee/i.test(k.damage_weapon_name || k.weapon?.name || '')).length;
-      if (knives) { score += 25 * knives; tags.push('COUTEAU'); }
-
-      const c = clutch[p.team];
-      if (c && c.puuid === puuid && winner === p.team && alive[p.team].has(puuid)) {
-        score += CLUTCH[Math.min(c.vs, 5)];
-        tags.push(`CLUTCH 1v${c.vs}`);
-        if (r.defuse_events?.defused_by?.puuid === puuid) { score += 20; tags.push('DEFUSE'); }
-      }
-
-      out.push({
-        game: 'valorant',
-        matchId: meta.matchid,
-        map: meta.map,
-        date: meta.game_start ? new Date(meta.game_start * 1000).toISOString() : null,
-        round: i + 1,
-        player: `${p.name}#${p.tag}`,
-        agent: p.character,
-        kills: n,
-        tags,
-        score,
-        // repères temporels depuis le début du match (ms) pour caler le clip dans la VOD
-        roundStartMs: ks[0].kill_time_in_match - ks[0].kill_time_in_round,
-        clipFromMs: Math.max(0, ks[0].kill_time_in_match - 8000),
-        clipToMs: ks[n - 1].kill_time_in_match + 3000,
-      });
-    }
-  });
+    if (!score) continue;
+    const pid = pp.player?.id;
+    out.push({
+      game: 'valorant',
+      matchId: Number(id),
+      url: `https://www.vlr.gg/${id}`,
+      vod: (d.vods || [])[0]?.link || null,
+      event: d.metadata?.event?.title || null,
+      date: d.metadata?.date || null,
+      teams: (d.teams || []).map(t => t.name),
+      maps: (d.games || []).map(g => g.map),
+      player: pp.player?.name,
+      team: teamOf[pid] || null,
+      agents: [...(agentsOf[pid] || [])],
+      tags,
+      score,
+    });
+  }
   return out;
 }
 
-// ---------- Providers ----------
-async function valorantClips(players = PLAYERS) {
-  const seen = new Set();
-  const clips = [];
-  const errors = [];
-  for (const entry of players) {
-    try {
-      const [id, region = 'eu'] = entry.split('@');
-      const [name, tag] = id.split('#');
-      const matches = await henrik(
-        `/valorant/v3/matches/${region}/${encodeURIComponent(name)}/${encodeURIComponent(tag)}?size=${MATCHES_PER_PLAYER}`
-      );
-      for (const m of matches || []) {
-        const mid = m.metadata?.matchid;
-        if (!mid || seen.has(mid)) continue;
-        seen.add(mid);
-        clips.push(...scoreMatch(m));
-      }
-    } catch (e) {
-      errors.push(`${entry} : ${e.message}`);
-    }
-    await sleep(500);
-  }
-  return { clips, errors };
+// ---------- État + worker (une seule file => une seule requête à la fois) ----------
+const matchCache = new Map();   // id -> moments[]
+const failures = new Map();     // id -> nb d'échecs
+const queue = new Set();
+const progress = { running: false, lastRefresh: null, errors: [] };
+let working = false;
+let discovering = false;
+
+function note(msg) {
+  progress.errors = [msg, ...progress.errors].slice(0, 5);
 }
 
-// TODO GRID : brancher ici (série -> matchs -> events kills/rounds), puis réutiliser la même logique de score
-const PROVIDERS = {
-  valorant: valorantClips,
-  cs2: null,
-  rl: null,
-};
+async function work() {
+  if (working) return;
+  working = true;
+  progress.running = true;
+  try {
+    while (queue.size) {
+      const id = Math.max(...queue);
+      queue.delete(id);
+      if (matchCache.has(id) || (failures.get(id) || 0) >= 2) continue;
+      try {
+        const d = await henrik(`/valorant/v2/esports/vlr/matches/${id}`);
+        matchCache.set(id, momentsFromMatch(d, id));
+      } catch (e) {
+        failures.set(id, (failures.get(id) || 0) + 1);
+        note(`match ${id} : ${e.message}`);
+      }
+    }
+  } finally {
+    working = false;
+    progress.running = false;
+  }
+}
+
+async function discover() {
+  const c = cfg();
+  const ids = [];
+  for (const region of c.regions) {
+    let events = [];
+    try {
+      const d = await henrik('/valorant/v2/esports/vlr/events', { region });
+      events = (Array.isArray(d) ? d : d?.events || [])
+        .filter(e => /ongoing|completed/i.test(e.status || ''))
+        .sort((a, b) => b.id - a.id)
+        .slice(0, c.eventsPerRegion);
+    } catch (e) { note(`événements ${region} : ${e.message}`); continue; }
+    for (const ev of events) {
+      try {
+        const d = await henrik(c.eventMatchesPath.replace('{id}', ev.id));
+        const arr = Array.isArray(d) ? d : d?.matches || [];
+        for (const m of arr) {
+          const mid = m.id ?? m.match?.id ?? m.match_id;
+          if (mid && !/upcoming|live/i.test(String(m.status || ''))) ids.push(Number(mid));
+        }
+      } catch (e) { note(`matchs de l'événement ${ev.id} : ${e.message}`); }
+    }
+  }
+  return [...new Set(ids)].sort((a, b) => b - a).slice(0, c.maxMatches);
+}
+
+export async function refresh() {
+  if (discovering) return;
+  discovering = true;
+  progress.running = true;
+  try {
+    for (const id of await discover()) if (!matchCache.has(id)) queue.add(id);
+    progress.lastRefresh = new Date().toISOString();
+  } catch (e) { note(e.message); }
+  finally { discovering = false; }
+  await work();
+}
+
+export function start() {
+  refresh().catch(e => note(e.message));
+  setInterval(() => refresh().catch(e => note(e.message)), cfg().refreshMs).unref?.();
+}
+
+export function parseIds(raw = '') {
+  return [...new Set(String(raw).split(/[\s,]+/).map(t => {
+    const m = t.match(/vlr\.gg\/(\d+)/) || t.match(/^(\d{4,})$/);
+    return m ? Number(m[1]) : null;
+  }).filter(Boolean))];
+}
 
 // ---------- API publique ----------
-const cache = {};
-export async function getClips({ game = 'valorant', limit = 30, players = PLAYERS } = {}) {
-  const games = game === 'all' ? Object.keys(PROVIDERS) : [game];
-  const clips = [];
-  const pending = [];
-  const errors = [];
-  for (const g of games) {
-    if (!(g in PROVIDERS)) throw new Error(`jeu inconnu: ${g}`);
-    if (!PROVIDERS[g]) { pending.push(g); continue; }
-    const key = g + ':' + players.join(',');
-    const c = cache[key];
-    if (!c || Date.now() - c.t > CACHE_TTL) {
-      const data = await PROVIDERS[g](players);
-      if (data.clips.length || !data.errors.length) cache[key] = { t: Date.now(), data };
-      else { errors.push(...data.errors); continue; }
-    }
-    clips.push(...cache[key].data.clips);
-    errors.push(...cache[key].data.errors);
+export async function getClips({ game = 'valorant', limit = 30, ids = [] } = {}) {
+  const games = game === 'all' ? ['valorant', 'cs2', 'rl'] : [game];
+  const pending = games.filter(g => g !== 'valorant');
+  let clips = [];
+  if (games.includes('valorant')) {
+    for (const id of ids.slice(0, 15)) if (!matchCache.has(id)) queue.add(id);
+    if (queue.size) work().catch(e => note(e.message));
+    const want = ids.length ? new Set(ids) : null;
+    for (const [id, moments] of matchCache) if (!want || want.has(id)) clips.push(...moments);
   }
-  clips.sort((a, b) => b.score - a.score);
+  clips = clips.filter(c => c.score >= cfg().minScore).sort((a, b) => b.score - a.score).slice(0, limit);
   return {
-    pending, // jeux en attente de l'API GRID
-    errors,
-    players,
-    clips: clips.filter(c => c.score >= MIN_SCORE).slice(0, limit),
+    pending,
+    clips,
+    progress: {
+      running: progress.running,
+      queued: queue.size,
+      analysed: matchCache.size,
+      lastRefresh: progress.lastRefresh,
+      errors: progress.errors,
+    },
   };
 }
 
 export function registerClipsRoute(app, path = '/api/clips') {
   app.get(path, async (req, res) => {
     try {
-      res.json(await getClips({ game: req.query.game || 'valorant', limit: Number(req.query.limit) || 30 }));
-    } catch (e) {
-      res.status(502).json({ error: e.message });
-    }
+      res.json(await getClips({
+        game: req.query.game || 'valorant',
+        limit: Number(req.query.limit) || 30,
+        ids: parseIds(req.query.ids),
+      }));
+    } catch (e) { res.status(502).json({ error: e.message }); }
   });
 }
 
-// ---------- CLI ----------
+// ---------- CLI : node clips.mjs ----------
+import { pathToFileURL } from 'node:url';
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [game = 'valorant', limit = 15] = process.argv.slice(2);
-  const { clips, pending } = await getClips({ game, limit: Number(limit) });
-  if (pending.length) console.log(`(en attente GRID : ${pending.join(', ')})\n`);
-  for (const c of clips) {
-    console.log(`${String(c.score).padStart(4)}  ${c.player} · ${c.agent} · ${c.map} R${c.round}  [${c.tags.join(' | ')}]`);
-  }
+  await refresh();
+  const { clips, progress: p } = await getClips({ limit: 20 });
+  console.log(`${p.analysed} matchs analysés`);
+  for (const c of clips) console.log(`${String(c.score).padStart(4)}  ${c.player} (${c.team}) · ${c.teams.join(' vs ')} · [${c.tags.join(' | ')}] ${c.url}`);
 }
