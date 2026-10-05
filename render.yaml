@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: clip-rounds
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: HENRIK_KEY
+        sync: false
+      - key: CLIP_PLAYERS
+        value: ManuelHexe#5777@eu

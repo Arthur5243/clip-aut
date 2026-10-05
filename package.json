@@ -1,0 +1,8 @@
+{
+  "name": "clip-rounds",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2" }
+}
