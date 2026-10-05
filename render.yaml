@@ -9,5 +9,3 @@ services:
     envVars:
       - key: HENRIK_KEY
         sync: false
-      - key: CLIP_PLAYERS
-        value: ManuelHexe#5777@eu
