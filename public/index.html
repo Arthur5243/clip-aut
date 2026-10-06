@@ -53,6 +53,7 @@ function load(){
       h+='<div class="card"><div class="sc">'+c.score+"<small>score</small></div><div><div class=\"t\">"+esc(c.player)+(c.team?" ("+esc(c.team)+")":"")+'</div><div class="m">'+esc((c.teams||[]).join(" vs "))+" · "+esc(c.event||"")+(c.date?" · "+esc(String(c.date).slice(0,10)):"")+'</div><div class="tags">'+c.tags.map(function(t){return '<span class="tag'+(/ACE|CLUTCH 1v[345]/.test(t)?" hot":"")+'">'+esc(t)+"</span>"}).join("")+'</div><div class="m"><a href="'+esc(safe(c.url))+'" target="_blank" rel="noopener">VLR</a>'+(c.vod?' · <a href="'+esc(safe(c.vod))+'" target="_blank" rel="noopener">VOD</a>':"")+"</div></div></div>";
     });
     out.innerHTML=h;
+    
     if(p.running||p.queued)timer=setTimeout(load,8000);
   }).catch(function(e){out.innerHTML='<div class="err">'+esc(e.message)+"</div>"});
 }
