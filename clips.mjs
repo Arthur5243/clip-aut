@@ -8,8 +8,8 @@ const cfg = () => ({
   key: process.env.HENRIK_KEY || '',
   interval: num(process.env.HENRIK_INTERVAL_MS, 2200), // 2,2 s => ~27 req/min
   regions: (process.env.CLIP_REGIONS || 'europe,north_america,asia_pacific').split(',').map(s => s.trim()).filter(Boolean),
-  eventsPerRegion: num(process.env.CLIP_EVENTS, 2),
-  maxMatches: num(process.env.CLIP_MAX_MATCHES, 40),
+  eventsPerRegion: num(process.env.CLIP_EVENTS, 4),
+  maxMatches: num(process.env.CLIP_MAX_MATCHES, 100),
   refreshMs: num(process.env.CLIP_REFRESH_MIN, 30) * 60000,
   minScore: num(process.env.CLIP_MIN_SCORE, 40),
   eventMatchesPath: process.env.EVENT_MATCHES_PATH || '/valorant/v2/esports/vlr/events/{id}/matches',
@@ -41,8 +41,16 @@ async function henrik(path, query = {}) {
       await sleep(ra > 0 ? ra * 1000 : 30000 * (attempt + 1)); // on laisse la fenêtre se vider
       continue;
     }
-    if (!res.ok) throw new Error(`Henrik ${res.status} ${path}`);
-    return (await res.json()).data;
+    if (!res.ok) {
+      let body = '';
+      try { body = (await res.text()).slice(0, 200); } catch {}
+      throw new Error(`Henrik ${res.status} ${path} ${body}`);
+    }
+    const json = await res.json();
+    if (json?.data === undefined || json?.data === null) {
+      throw new Error(`Réponse inattendue ${path} : ${JSON.stringify(json).slice(0, 200)}`);
+    }
+    return json.data;
   }
   throw new Error('Henrik : limite de requêtes (429) persistante');
 }
@@ -110,6 +118,7 @@ export function momentsFromMatch(d, id) {
 // ---------- État + worker (une seule file => une seule requête à la fois) ----------
 const matchCache = new Map();   // id -> moments[]
 const failures = new Map();     // id -> nb d'échecs
+const unplayed = new Map();     // id -> date du dernier constat "pas encore joué"
 const queue = new Set();
 const progress = { running: false, lastRefresh: null, errors: [], stats: { withPerf: 0, noPerf: 0, skipped: 0 }, empty: [] };
 let working = false;
@@ -128,9 +137,17 @@ async function work() {
       const id = Math.max(...queue);
       queue.delete(id);
       if (matchCache.has(id) || (failures.get(id) || 0) >= 2) continue;
+      if (Date.now() - (unplayed.get(id) || 0) < cfg().refreshMs) continue;
       try {
         const d = await henrik(`/valorant/v2/esports/vlr/matches/${id}`);
-        if (/upcoming|live/i.test(String(d?.metadata?.status || ''))) { progress.stats.skipped++; continue; }
+        if (!d || typeof d !== 'object' || (!d.metadata && !d.games)) throw new Error('données vides : ' + JSON.stringify(d).slice(0, 150));
+        const hasStats = !!d.performance?.player_performances?.length ||
+          (d.games || []).some(g => (g.teams || []).some(t => (t.players || []).some(p => p.stats && p.stats.kills != null)));
+        if (!hasStats || /upcoming|live/i.test(String(d?.metadata?.status || ''))) {
+          unplayed.set(id, Date.now()); // match pas (encore) joué : on le revérifiera plus tard
+          progress.stats.skipped++;
+          continue;
+        }
         const moments = momentsFromMatch(d, id);
         matchCache.set(id, moments);
         if (d?.performance) progress.stats.withPerf++; else progress.stats.noPerf++;
@@ -177,7 +194,10 @@ export async function refresh() {
   discovering = true;
   progress.running = true;
   try {
-    for (const id of await discover()) if (!matchCache.has(id)) queue.add(id);
+    for (const id of await discover()) {
+      if (matchCache.has(id) || Date.now() - (unplayed.get(id) || 0) < cfg().refreshMs) continue;
+      queue.add(id);
+    }
     progress.lastRefresh = new Date().toISOString();
   } catch (e) { note(e.message); }
   finally { discovering = false; }
