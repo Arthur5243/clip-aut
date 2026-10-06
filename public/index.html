@@ -42,7 +42,7 @@ function load(){
   var u="/api/clips?game="+game+"&limit=40"+(ids.value?"&ids="+encodeURIComponent(ids.value):"");
   fetch(u).then(function(r){return r.json()}).then(function(d){
     var p=d.progress||{},h="";
-    st.textContent=(p.running||p.queued)?("Analyse en cours… "+(p.analysed||0)+" matchs analysés, "+(p.queued||0)+" en attente (limite 30 req/min)"):((p.analysed||0)+" matchs analysés"+(p.stats?" ("+p.stats.withPerf+" avec stats détaillées, "+p.stats.noPerf+" sans)":""));
+    st.textContent=(p.running||p.queued)?("Analyse en cours… "+(p.analysed||0)+" matchs analysés, "+(p.queued||0)+" en attente (limite 30 req/min)"):((p.analysed||0)+" matchs joués analysés"+(p.stats?" ("+p.stats.withPerf+" avec stats détaillées, "+p.stats.noPerf+" stats de map seulement, "+p.stats.skipped+" pas encore joués ignorés)":""));
     if(d.error)h+='<div class="err">'+esc(d.error)+"</div>";
     if(p.errors&&p.errors.length)h+='<div class="err">'+p.errors.map(esc).join("<br>")+"</div>";
     if(d.pending&&d.pending.length)h+='<div class="note">'+d.pending.join(", ").toUpperCase()+" : en attente de l'API GRID.</div>";
@@ -53,7 +53,6 @@ function load(){
       h+='<div class="card"><div class="sc">'+c.score+"<small>score</small></div><div><div class=\"t\">"+esc(c.player)+(c.team?" ("+esc(c.team)+")":"")+'</div><div class="m">'+esc((c.teams||[]).join(" vs "))+" · "+esc(c.event||"")+(c.date?" · "+esc(String(c.date).slice(0,10)):"")+'</div><div class="tags">'+c.tags.map(function(t){return '<span class="tag'+(/ACE|CLUTCH 1v[345]/.test(t)?" hot":"")+'">'+esc(t)+"</span>"}).join("")+'</div><div class="m"><a href="'+esc(safe(c.url))+'" target="_blank" rel="noopener">VLR</a>'+(c.vod?' · <a href="'+esc(safe(c.vod))+'" target="_blank" rel="noopener">VOD</a>':"")+"</div></div></div>";
     });
     out.innerHTML=h;
-    
     if(p.running||p.queued)timer=setTimeout(load,8000);
   }).catch(function(e){out.innerHTML='<div class="err">'+esc(e.message)+"</div>"});
 }
