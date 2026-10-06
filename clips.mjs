@@ -11,7 +11,7 @@ const cfg = () => ({
   eventsPerRegion: num(process.env.CLIP_EVENTS, 2),
   maxMatches: num(process.env.CLIP_MAX_MATCHES, 40),
   refreshMs: num(process.env.CLIP_REFRESH_MIN, 30) * 60000,
-  minScore: num(process.env.CLIP_MIN_SCORE, 60),
+  minScore: num(process.env.CLIP_MIN_SCORE, 40),
   eventMatchesPath: process.env.EVENT_MATCHES_PATH || '/valorant/v2/esports/vlr/events/{id}/matches',
 });
 
@@ -52,21 +52,27 @@ const MK = [['5k', 200, 'ACE'], ['4k', 80, '4K'], ['3k', 30, '3K']];
 const CL = [['1v5', 400], ['1v4', 200], ['1v3', 90], ['1v2', 30], ['1v1', 5]];
 
 export function momentsFromMatch(d, id) {
-  const perf = d?.performance?.player_performances || [];
-  const teamOf = {}, agentsOf = {};
+  const perfBy = new Map((d?.performance?.player_performances || []).map(pp => [String(pp.player?.id), pp]));
+  const info = new Map();
   for (const g of d?.games || []) {
     for (const t of g.teams || []) {
       for (const p of t.players || []) {
         const pid = p.player?.id;
         if (pid == null) continue;
-        teamOf[pid] ??= t.name;
-        (agentsOf[pid] ||= new Set()).add(p.agent);
+        const i = info.get(String(pid)) || { name: p.player?.name, team: t.name, agents: new Set(), acs: 0, kills: 0, fk: 0 };
+        i.agents.add(p.agent);
+        const st = p.stats || {};
+        i.acs = Math.max(i.acs, st.acs || 0);
+        i.kills = Math.max(i.kills, st.kills || 0);
+        i.fk = Math.max(i.fk, st.first_kills || 0);
+        info.set(String(pid), i);
       }
     }
   }
   const out = [];
-  for (const pp of perf) {
-    const mk = pp.multi_kills || {}, cl = pp.clutches || {};
+  for (const pid of new Set([...info.keys(), ...perfBy.keys()])) {
+    const pp = perfBy.get(pid), i = info.get(pid);
+    const mk = pp?.multi_kills || {}, cl = pp?.clutches || {};
     let score = 0;
     const tags = [];
     for (const [k, pts, label] of MK) {
@@ -75,8 +81,13 @@ export function momentsFromMatch(d, id) {
     for (const [k, pts] of CL) {
       if (cl[k]) { score += pts * cl[k]; if (k !== '1v1') tags.push(`CLUTCH ${k}${cl[k] > 1 ? ` ×${cl[k]}` : ''}`); }
     }
+    // Secours / bonus : grosses stats sur une map
+    if (i) {
+      if (i.kills >= 28) { score += (i.kills - 25) * 10; tags.push(`${i.kills} kills sur une map`); }
+      if (i.acs >= 350) { score += Math.round((i.acs - 300) / 2); tags.push(`ACS ${i.acs}`); }
+      if (i.fk >= 8) { score += (i.fk - 6) * 5; tags.push(`${i.fk} first kills`); }
+    }
     if (!score) continue;
-    const pid = pp.player?.id;
     out.push({
       game: 'valorant',
       matchId: Number(id),
@@ -86,9 +97,9 @@ export function momentsFromMatch(d, id) {
       date: d.metadata?.date || null,
       teams: (d.teams || []).map(t => t.name),
       maps: (d.games || []).map(g => g.map),
-      player: pp.player?.name,
-      team: teamOf[pid] || null,
-      agents: [...(agentsOf[pid] || [])],
+      player: pp?.player?.name || i?.name,
+      team: i?.team || null,
+      agents: i ? [...i.agents] : [],
       tags,
       score,
     });
@@ -100,7 +111,7 @@ export function momentsFromMatch(d, id) {
 const matchCache = new Map();   // id -> moments[]
 const failures = new Map();     // id -> nb d'échecs
 const queue = new Set();
-const progress = { running: false, lastRefresh: null, errors: [] };
+const progress = { running: false, lastRefresh: null, errors: [], stats: { withPerf: 0, noPerf: 0, skipped: 0 }, empty: [] };
 let working = false;
 let discovering = false;
 
@@ -119,7 +130,11 @@ async function work() {
       if (matchCache.has(id) || (failures.get(id) || 0) >= 2) continue;
       try {
         const d = await henrik(`/valorant/v2/esports/vlr/matches/${id}`);
-        matchCache.set(id, momentsFromMatch(d, id));
+        if (/upcoming|live/i.test(String(d?.metadata?.status || ''))) { progress.stats.skipped++; continue; }
+        const moments = momentsFromMatch(d, id);
+        matchCache.set(id, moments);
+        if (d?.performance) progress.stats.withPerf++; else progress.stats.noPerf++;
+        if (!moments.length) progress.empty = [id, ...progress.empty].slice(0, 5);
       } catch (e) {
         failures.set(id, (failures.get(id) || 0) + 1);
         note(`match ${id} : ${e.message}`);
@@ -202,11 +217,31 @@ export async function getClips({ game = 'valorant', limit = 30, ids = [] } = {})
       analysed: matchCache.size,
       lastRefresh: progress.lastRefresh,
       errors: progress.errors,
+      stats: progress.stats,
+      empty: progress.empty,
     },
   };
 }
 
+export async function debugMatch(id) {
+  const d = await henrik(`/valorant/v2/esports/vlr/matches/${id}`);
+  const g0 = d?.games?.[0];
+  return {
+    keys: Object.keys(d || {}),
+    status: d?.metadata?.status,
+    hasPerformance: !!d?.performance,
+    performanceSample: (d?.performance?.player_performances || []).slice(0, 2),
+    gamesCount: (d?.games || []).length,
+    firstGamePlayerSample: g0?.teams?.[0]?.players?.slice(0, 2),
+    vods: d?.vods,
+  };
+}
+
 export function registerClipsRoute(app, path = '/api/clips') {
+  app.get(path + '/debug', async (req, res) => {
+    try { res.json(await debugMatch(Number(req.query.id))); }
+    catch (e) { res.status(502).json({ error: e.message }); }
+  });
   app.get(path, async (req, res) => {
     try {
       res.json(await getClips({
